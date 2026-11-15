@@ -1,0 +1,3 @@
+Firma del APK de Mando servidor.
+Guardala: sin este archivo no se pueden publicar actualizaciones que se instalen encima.
+No la subas a GitHub.

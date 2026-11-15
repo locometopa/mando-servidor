@@ -1,0 +1,10 @@
+﻿{
+    "ServidorLan":  "192.168.1.180",
+    "ServidorTailscale":  "100.124.132.5",
+    "Usuario":  "locometopa",
+    "Mac":  "80:ee:73:d7:fb:4b",
+    "NasLan":  "192.168.1.150",
+    "NasTailscale":  "100.127.53.156",
+    "NasUsuario":  "locometopa",
+    "NasInterfaz":  "eth0"
+}

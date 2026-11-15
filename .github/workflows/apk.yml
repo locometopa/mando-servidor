@@ -21,7 +21,7 @@ jobs:
         env:
           KS: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
-          if [ -n "$KS" ]; then echo "$KS" | base64 -d > "$RUNNER_TEMP/firma.jks"; echo "KEYSTORE_FILE=$RUNNER_TEMP/firma.jks" >> "$GITHUB_ENV"; fi
+          if [ -n "$KS" ]; then printf "%s" "$KS" | tr -d " \r\n" | base64 -d > "$RUNNER_TEMP/firma.jks"; echo "KEYSTORE_FILE=$RUNNER_TEMP/firma.jks" >> "$GITHUB_ENV"; fi
       - name: Compilar
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}

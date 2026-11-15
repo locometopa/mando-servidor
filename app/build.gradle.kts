@@ -22,9 +22,9 @@ android {
         create("release") {
             if (firma != null) {
                 storeFile = file(firma)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                storePassword = System.getenv("KEYSTORE_PASSWORD")?.trim()
                 keyAlias = "mando"
-                keyPassword = System.getenv("KEYSTORE_PASSWORD")
+                keyPassword = System.getenv("KEYSTORE_PASSWORD")?.trim()
             }
         }
     }

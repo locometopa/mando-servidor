@@ -11,7 +11,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.text.InputType
+import android.util.Base64
 import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
@@ -29,6 +32,11 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -120,12 +128,12 @@ class MainActivity : Activity() {
         raiz.addView(boton("Encender", VERDE) { encender() })
         raiz.addView(boton("Reiniciar", NARANJA) {
             confirmar("¿Reiniciar el servidor?", "Los servicios se cortarán un par de minutos.") {
-                ordenServidor("sudo -n /usr/sbin/reboot", "Reiniciando el servidor…")
+                ordenServidor("SUDO /usr/sbin/reboot", "Reiniciando el servidor…")
             }
         })
         raiz.addView(boton("Apagar", ROJO) {
             confirmar("¿Apagar el servidor?", "Si estás fuera de casa perderás el acceso a la red de casa hasta que lo enciendas.") {
-                ordenServidor("sudo -n /usr/sbin/poweroff", "Apagando el servidor…")
+                ordenServidor("SUDO /usr/sbin/poweroff", "Apagando el servidor…")
             }
         })
 
@@ -276,9 +284,10 @@ class MainActivity : Activity() {
             avisar("Fuera de casa: enviando la señal a través del NAS…")
             val m = cfg("mac")
             val i = cfg("nasInterfaz")
-            val r = ssh(
+            val r = ejecutar(
                 cfg("nasUsuario"), cfg("nasTs"),
-                "if [ -x /usr/syno/sbin/synonet ]; then sudo -n /usr/syno/sbin/synonet --wake $m $i; else sudo -n /usr/syno/bin/synonet --wake $m $i; fi"
+                "if [ -x /usr/syno/sbin/synonet ]; then SUDO /usr/syno/sbin/synonet --wake $m $i; else SUDO /usr/syno/bin/synonet --wake $m $i; fi",
+                "pwNas"
             )
             avisar(
                 if (r.ok) "Señal enviada a través del NAS.\nTarda 1-2 minutos en arrancar."
@@ -293,9 +302,65 @@ class MainActivity : Activity() {
         avisar(txt)
         thread {
             val h = vivo ?: cfg("servidorLan")
-            val r = ssh(cfg("usuario"), h, cmd)
-            val cortado = r.texto.contains("closed", true) || r.texto.contains("código -1") || r.texto.contains("reset", true)
-            avisar(if (r.ok || cortado) "Orden enviada." else "Error: ${r.texto}" + pista(r.texto))
+            val r = ejecutar(cfg("usuario"), h, cmd, "pwServidor")
+            avisar(if (r.ok || cortado(r.texto)) "Orden enviada." else "Error: ${r.texto}" + pista(r.texto))
+        }
+    }
+
+    private fun cortado(t: String) =
+        t.contains("closed", true) || t.contains("código -1") || t.contains("reset", true)
+
+    private fun esAuth(t: String) = t.contains("Auth fail", true) || t.contains("Auth cancel", true)
+
+    // Ejecuta una orden: primero con la llave del móvil; si hace falta, con la contraseña guardada.
+    private fun ejecutar(usuario: String, host: String, plantilla: String, pwClave: String): Resultado {
+        val r = ssh(usuario, host, plantilla.replace("SUDO", "sudo -n"))
+        if (r.ok || cortado(r.texto)) return r
+        val pw = leerClave(pwClave)
+        if (pw.isNullOrEmpty()) return r
+        val conSudo = plantilla.replace("SUDO", "sudo -S -p ''")
+        if (!esAuth(r.texto)) {
+            val r2 = ssh(usuario, host, conSudo, null, pw + "\n")
+            if (r2.ok || cortado(r2.texto) || !esAuth(r2.texto)) return r2
+        }
+        return ssh(usuario, host, conSudo, pw, pw + "\n")
+    }
+
+    // ---------------- Contraseñas cifradas (Android Keystore) ----------------
+
+    private fun claveAes(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getEntry("mando_pw", null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
+        val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        g.init(
+            KeyGenParameterSpec.Builder("mando_pw", KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build()
+        )
+        return g.generateKey()
+    }
+
+    private fun guardarClave(nombre: String, valor: String) {
+        try {
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.ENCRYPT_MODE, claveAes())
+            val datos = c.iv + c.doFinal(valor.toByteArray())
+            prefs.edit().putString(nombre, Base64.encodeToString(datos, Base64.NO_WRAP)).apply()
+        } catch (e: Exception) {
+            avisar("No se pudo guardar la contraseña: ${e.message}")
+        }
+    }
+
+    private fun leerClave(nombre: String): String? {
+        val s = prefs.getString(nombre, null) ?: return null
+        return try {
+            val b = Base64.decode(s, Base64.NO_WRAP)
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, claveAes(), GCMParameterSpec(128, b, 0, 12))
+            String(c.doFinal(b, 12, b.size - 12))
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -383,7 +448,7 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(8), dp(20), 0)
         }
         caja.addView(TextView(this).apply {
-            text = "Se pide una sola vez y no se guarda: el móvil instala su propia llave en el servidor y en el NAS.\n\nPara el NAS tienes que estar en casa o con Tailscale activo."
+            text = "El móvil instala su propia llave en el servidor y en el NAS. Las contraseñas se guardan cifradas en el móvil como respaldo.\n\nPara el NAS tienes que estar en casa o con Tailscale activo."
             textSize = 14f
         })
         val ps = campoClave("Contraseña del servidor")
@@ -403,6 +468,8 @@ class MainActivity : Activity() {
             "(grep -qF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys"
 
     private fun hacerAutorizar(ps: String, pn: String) {
+        if (ps.isNotEmpty()) guardarClave("pwServidor", ps)
+        if (pn.isNotEmpty()) guardarClave("pwNas", pn)
         avisar("Autorizando… (la primera vez tarda unos segundos en crear la llave)")
         thread {
             val pub = try {
@@ -460,6 +527,20 @@ class MainActivity : Activity() {
             caja.addView(e)
             cajas[k] = e
         }
+        caja.addView(TextView(this).apply {
+            text = "Contraseña del servidor" + (if (leerClave("pwServidor") != null) " (guardada)" else "")
+            textSize = 13f
+            setPadding(0, dp(10), 0, 0)
+        })
+        val pwS = campoClave("En blanco = no cambiarla")
+        caja.addView(pwS)
+        caja.addView(TextView(this).apply {
+            text = "Contraseña del NAS" + (if (leerClave("pwNas") != null) " (guardada)" else "")
+            textSize = 13f
+            setPadding(0, dp(10), 0, 0)
+        })
+        val pwN = campoClave("En blanco = no cambiarla")
+        caja.addView(pwN)
         AlertDialog.Builder(this)
             .setTitle("Ajustes")
             .setView(ScrollView(this).apply { addView(caja) })
@@ -467,6 +548,8 @@ class MainActivity : Activity() {
                 val ed = prefs.edit()
                 for ((k, e) in cajas) ed.putString(k, e.text.toString().trim())
                 ed.apply()
+                if (pwS.text.isNotEmpty()) guardarClave("pwServidor", pwS.text.toString())
+                if (pwN.text.isNotEmpty()) guardarClave("pwNas", pwN.text.toString())
                 if (macBytes() == null) avisar("La MAC no parece correcta (ejemplo: 80:ee:73:aa:bb:cc).")
                 else avisar("Ajustes guardados.")
             }

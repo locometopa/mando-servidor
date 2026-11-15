@@ -16,15 +16,20 @@ import android.security.keystore.KeyProperties
 import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.KeyPair
 import com.jcraft.jsch.Session
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.DatagramPacket
@@ -33,6 +38,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.KeyStore
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -43,6 +50,7 @@ class MainActivity : Activity() {
 
     companion object {
         val FONDO = Color.rgb(30, 32, 36)
+        val TARJETA = Color.rgb(44, 47, 53)
         val VERDE = Color.rgb(46, 125, 50)
         val NARANJA = Color.rgb(230, 126, 34)
         val ROJO = Color.rgb(198, 40, 40)
@@ -54,33 +62,83 @@ class MainActivity : Activity() {
         val ROJO_CLARO = Color.rgb(239, 115, 115)
     }
 
+    /** so: "linux" (apagar por SSH con sudo), "windows" (apagar con shutdown), "wol" (solo encender) */
+    data class Equipo(
+        val id: String,
+        val nombre: String,
+        val so: String,
+        val mac: String,
+        val lan: String,
+        val ts: String,
+        val usuario: String,
+        val web: String,
+    )
+
     class Resultado(val ok: Boolean, val texto: String)
 
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
-    private lateinit var estado: TextView
-    private lateinit var info: TextView
+    private lateinit var lista: LinearLayout
     private lateinit var aviso: TextView
 
-    @Volatile private var vivo: String? = null
+    @Volatile private var equipos: List<Equipo> = emptyList()
+    private val vivos = ConcurrentHashMap<String, String>()   // id -> host que responde ("" = apagado)
+    private val estados = HashMap<String, TextView>()
     @Volatile private var generacion = 0
 
-    // clave -> (etiqueta, valor por defecto)
-    private val campos = linkedMapOf(
-        "mac" to ("MAC del servidor (ej. 80:ee:73:aa:bb:cc)" to ""),
-        "usuario" to ("Usuario del servidor" to "locometopa"),
-        "servidorLan" to ("IP del servidor (casa)" to "192.168.1.180"),
-        "servidorTs" to ("IP del servidor (Tailscale)" to "100.124.132.5"),
+    private val nasCampos = linkedMapOf(
         "nasUsuario" to ("Usuario del NAS" to "locometopa"),
         "nasLan" to ("IP del NAS (casa)" to "192.168.1.150"),
         "nasTs" to ("IP del NAS (Tailscale)" to "100.127.53.156"),
         "nasInterfaz" to ("Interfaz de red del NAS" to "eth0"),
     )
 
-    private fun cfg(k: String): String =
-        prefs.getString(k, null)?.trim()?.takeIf { it.isNotEmpty() } ?: campos[k]!!.second
+    private fun nas(k: String): String =
+        prefs.getString(k, null)?.trim()?.takeIf { it.isNotEmpty() } ?: nasCampos[k]!!.second
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    // ---------------- Datos ----------------
+
+    private fun cargar() {
+        val txt = prefs.getString("equipos", null)
+        if (txt == null) {
+            // Primera vez (o versión anterior): el servidor de casa
+            val s = Equipo(
+                id = "servidor",
+                nombre = "Servidor",
+                so = "linux",
+                mac = prefs.getString("mac", "") ?: "",
+                lan = prefs.getString("servidorLan", null)?.takeIf { it.isNotBlank() } ?: "192.168.1.180",
+                ts = prefs.getString("servidorTs", null)?.takeIf { it.isNotBlank() } ?: "100.124.132.5",
+                usuario = prefs.getString("usuario", null)?.takeIf { it.isNotBlank() } ?: "locometopa",
+                web = "http://192.168.1.180/",
+            )
+            prefs.getString("pwServidor", null)?.let { prefs.edit().putString("pw_servidor", it).apply() }
+            equipos = listOf(s)
+            guardar()
+            return
+        }
+        val arr = JSONArray(txt)
+        equipos = (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Equipo(
+                o.optString("id"), o.optString("nombre"), o.optString("so", "wol"), o.optString("mac"),
+                o.optString("lan"), o.optString("ts"), o.optString("usuario"), o.optString("web"),
+            )
+        }
+    }
+
+    private fun guardar() {
+        val arr = JSONArray()
+        for (e in equipos) {
+            arr.put(JSONObject().apply {
+                put("id", e.id); put("nombre", e.nombre); put("so", e.so); put("mac", e.mac)
+                put("lan", e.lan); put("ts", e.ts); put("usuario", e.usuario); put("web", e.web)
+            })
+        }
+        prefs.edit().putString("equipos", arr.toString()).apply()
+    }
 
     // ---------------- Interfaz ----------------
 
@@ -89,84 +147,130 @@ class MainActivity : Activity() {
         prefs = getSharedPreferences("mando", MODE_PRIVATE)
         window.statusBarColor = FONDO
         window.navigationBarColor = FONDO
+        cargar()
 
         val raiz = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(FONDO)
-            setPadding(dp(20), dp(28), dp(20), dp(28))
+            setPadding(dp(16), dp(24), dp(16), dp(28))
         }
         raiz.addView(TextView(this).apply {
-            text = "Servidor de casa"
+            text = "Equipos de casa"
             setTextColor(Color.WHITE)
             textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         })
-        estado = TextView(this).apply {
-            text = "●  Comprobando…"
-            setTextColor(AMARILLO)
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setPadding(0, dp(20), 0, dp(4))
-        }
-        info = TextView(this).apply {
-            setTextColor(GRIS)
-            textSize = 14f
-            gravity = Gravity.CENTER
-        }
         aviso = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 15f
             gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, dp(8))
+            setPadding(0, dp(10), 0, 0)
         }
-        raiz.addView(estado)
-        raiz.addView(info)
         raiz.addView(aviso)
-
-        raiz.addView(boton("Encender", VERDE) { encender() })
-        raiz.addView(boton("Reiniciar", NARANJA) {
-            confirmar("¿Reiniciar el servidor?", "Los servicios se cortarán un par de minutos.") {
-                ordenServidor("SUDO /usr/sbin/reboot", "Reiniciando el servidor…")
-            }
-        })
-        raiz.addView(boton("Apagar", ROJO) {
-            confirmar("¿Apagar el servidor?", "Si estás fuera de casa perderás el acceso a la red de casa hasta que lo enciendas.") {
-                ordenServidor("SUDO /usr/sbin/poweroff", "Apagando el servidor…")
-            }
-        })
-
-        val fila = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fila.addView(boton("Página de inicio", AZUL) { abrir("http://${vivo ?: cfg("servidorLan")}/") },
-            LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(6); topMargin = dp(12) })
-        fila.addView(boton("Cockpit", AZUL) { abrir("https://${vivo ?: cfg("servidorLan")}:9090/") },
-            LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(6); topMargin = dp(12) })
-        raiz.addView(fila)
-
-        raiz.addView(boton("Autorizar este móvil", GRIS_OSC) { autorizar() })
-        raiz.addView(boton("Ajustes", GRIS_OSC) { ajustes() })
+        lista = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        raiz.addView(lista)
+        raiz.addView(boton("+  Añadir equipo", GRIS_OSC) { editarEquipo(null) })
+        raiz.addView(boton("Ajustes del NAS (encender desde fuera)", GRIS_OSC) { ajustesNas() })
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(FONDO)
             addView(raiz)
         })
+        pintar()
+    }
 
-        if (prefs.getString("mac", "").isNullOrBlank()) {
-            avisar("Primero entra en Ajustes y pon la MAC del servidor.")
+    private fun pintar() {
+        lista.removeAllViews()
+        estados.clear()
+        for (e in equipos) lista.addView(tarjeta(e))
+        for (e in equipos) mostrarEstado(e)
+    }
+
+    private fun tarjeta(e: Equipo): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply { setColor(TARJETA); cornerRadius = dp(14).toFloat() }
+            setPadding(dp(16), dp(12), dp(16), dp(14))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(14) }
+        }
+        val cab = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        cab.addView(TextView(this).apply {
+            text = e.nombre
+            setTextColor(Color.WHITE)
+            textSize = 19f
+            typeface = Typeface.DEFAULT_BOLD
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        cab.addView(Button(this).apply {
+            text = "Editar"
+            isAllCaps = false
+            textSize = 14f
+            setTextColor(GRIS)
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { editarEquipo(e) }
+        })
+        card.addView(cab)
+
+        val est = TextView(this).apply {
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        estados[e.id] = est
+        card.addView(est)
+
+        val fila = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun peq(t: String, c: Int, a: () -> Unit) {
+            fila.addView(boton(t, c, 46, a), LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+                topMargin = dp(10); marginStart = dp(3); marginEnd = dp(3)
+            })
+        }
+        peq("Encender", VERDE) { encender(e) }
+        if (e.so != "wol") {
+            peq("Reiniciar", NARANJA) {
+                confirmar("¿Reiniciar ${e.nombre}?", "Se cortará lo que esté haciendo.") { apagar(e, true) }
+            }
+            peq("Apagar", ROJO) {
+                val extra = if (e.so == "linux") "\n\nSi estás fuera de casa y es el servidor, perderás el acceso a la red de casa hasta que lo enciendas." else ""
+                confirmar("¿Apagar ${e.nombre}?", "Se apagará ahora mismo.$extra") { apagar(e, false) }
+            }
+        }
+        card.addView(fila)
+        if (e.web.isNotBlank()) {
+            card.addView(boton("Abrir web", AZUL, 44) {
+                val h = vivos[e.id]
+                abrir(if (!h.isNullOrEmpty() && h != e.lan && e.lan.isNotBlank()) e.web.replace(e.lan, h) else e.web)
+            })
+        }
+        return card
+    }
+
+    private fun mostrarEstado(e: Equipo) {
+        val tv = estados[e.id] ?: return
+        val h = vivos[e.id]
+        when {
+            h == null -> { tv.text = "●  Comprobando…"; tv.setTextColor(AMARILLO) }
+            h.isEmpty() -> { tv.text = "●  Apagado o sin conexión"; tv.setTextColor(ROJO_CLARO) }
+            else -> {
+                tv.text = "●  Encendido · " + (if (h == e.lan) "en casa" else "por Tailscale")
+                tv.setTextColor(VERDE_CLARO)
+            }
         }
     }
 
-    private fun boton(t: String, color: Int, accion: () -> Unit) = Button(this).apply {
+    private fun boton(t: String, color: Int, alto: Int = 56, accion: () -> Unit) = Button(this).apply {
         text = t
         isAllCaps = false
-        textSize = 17f
+        textSize = if (alto < 56) 15f else 17f
         setTextColor(Color.WHITE)
         background = GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(12).toFloat()
         }
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)).apply { topMargin = dp(12) }
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(alto)).apply { topMargin = dp(12) }
         setOnClickListener { accion() }
     }
 
@@ -187,7 +291,7 @@ class MainActivity : Activity() {
 
     private fun abrir(url: String) {
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(if (url.contains("://")) url else "http://$url")))
         } catch (e: Exception) {
             avisar("No se pudo abrir el navegador.")
         }
@@ -200,7 +304,13 @@ class MainActivity : Activity() {
         val gen = ++generacion
         thread {
             while (gen == generacion) {
-                comprobar()
+                val hilos = equipos.map { e ->
+                    thread {
+                        vivos[e.id] = comprobar(e) ?: ""
+                        ui.post { mostrarEstado(e) }
+                    }
+                }
+                hilos.forEach { it.join() }
                 Thread.sleep(3000)
             }
         }
@@ -217,43 +327,42 @@ class MainActivity : Activity() {
         false
     }
 
-    private fun comprobar() {
-        val lan = cfg("servidorLan")
-        val ts = cfg("servidorTs")
-        val h = when {
-            puerto(lan, 22, 800) -> lan
-            puerto(ts, 22, 2000) -> ts
+    private fun responde(host: String, puertos: List<Int>, ms: Int): Boolean {
+        if (host.isBlank()) return false
+        val ok = AtomicBoolean(false)
+        puertos.map { p -> thread { if (puerto(host, p, ms)) ok.set(true) } }.forEach { it.join() }
+        return ok.get()
+    }
+
+    private fun comprobar(e: Equipo): String? {
+        val puertos = if (e.so == "linux") listOf(22) else listOf(22, 3389, 445, 135)
+        return when {
+            responde(e.lan, puertos, 800) -> e.lan
+            responde(e.ts, puertos, 2000) -> e.ts
             else -> null
-        }
-        vivo = h
-        ui.post {
-            if (h != null) {
-                estado.text = "●  Encendido"
-                estado.setTextColor(VERDE_CLARO)
-                info.text = "Responde por " + (if (h == lan) "la red de casa" else "Tailscale") + " ($h)"
-            } else {
-                estado.text = "●  Apagado o sin conexión"
-                estado.setTextColor(ROJO_CLARO)
-                info.text = "No responde ni en casa ni por Tailscale"
-            }
         }
     }
 
+    private fun hostDe(e: Equipo): String = vivos[e.id]?.takeIf { it.isNotEmpty() } ?: e.lan
+
     // ---------------- Encender ----------------
 
-    private fun macBytes(): ByteArray? {
-        val h = cfg("mac").replace(":", "").replace("-", "")
+    private fun macBytes(mac: String): ByteArray? {
+        val h = mac.replace(":", "").replace("-", "").trim()
         if (!Regex("^[0-9A-Fa-f]{12}$").matches(h)) return null
         return ByteArray(6) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
     }
 
-    private fun enviarWol(mac: ByteArray) {
+    private fun enviarWol(mac: ByteArray, lan: String) {
         val p = ByteArray(102)
         for (i in 0 until 6) p[i] = 0xFF.toByte()
         for (r in 1..16) System.arraycopy(mac, 0, p, r * 6, 6)
+        val destinos = mutableListOf("255.255.255.255")
+        val partes = lan.split(".")
+        if (partes.size == 4) destinos += "${partes[0]}.${partes[1]}.${partes[2]}.255"
         DatagramSocket().use { s ->
             s.broadcast = true
-            for (d in listOf("255.255.255.255", "192.168.1.255")) {
+            for (d in destinos) {
                 for (port in listOf(7, 9)) {
                     try {
                         s.send(DatagramPacket(p, p.size, InetAddress.getByName(d), port))
@@ -264,33 +373,33 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun encender() {
-        val mac = macBytes()
+    private fun encender(e: Equipo) {
+        val mac = macBytes(e.mac)
         if (mac == null) {
-            mensaje("Falta la MAC", "Pon la MAC del servidor en Ajustes.")
+            mensaje("Falta la MAC", "Pon la MAC de «${e.nombre}» en Editar.")
             return
         }
-        avisar("Enviando la señal de encendido…")
+        avisar("${e.nombre}: enviando la señal de encendido…")
         thread {
             try {
-                enviarWol(mac)
-            } catch (e: Exception) {
+                enviarWol(mac, e.lan)
+            } catch (x: Exception) {
             }
-            val enCasa = listOf(445, 5000, 5001).any { puerto(cfg("nasLan"), it, 600) }
+            val enCasa = listOf(445, 5000, 5001).any { puerto(nas("nasLan"), it, 600) }
             if (enCasa) {
-                avisar("Señal enviada por la red de casa.\nTarda 1-2 minutos en arrancar.")
+                avisar("${e.nombre}: señal enviada por la red de casa.\nTarda 1-2 minutos en arrancar.")
                 return@thread
             }
-            avisar("Fuera de casa: enviando la señal a través del NAS…")
-            val m = cfg("mac")
-            val i = cfg("nasInterfaz")
-            val r = ejecutar(
-                cfg("nasUsuario"), cfg("nasTs"),
+            avisar("${e.nombre}: fuera de casa, enviando la señal a través del NAS…")
+            val m = e.mac.trim()
+            val i = nas("nasInterfaz")
+            val r = ejecutarLinux(
+                nas("nasUsuario"), nas("nasTs"),
                 "if [ -x /usr/syno/sbin/synonet ]; then SUDO /usr/syno/sbin/synonet --wake $m $i; else SUDO /usr/syno/bin/synonet --wake $m $i; fi",
                 "pwNas"
             )
             avisar(
-                if (r.ok) "Señal enviada a través del NAS.\nTarda 1-2 minutos en arrancar."
+                if (r.ok) "${e.nombre}: señal enviada a través del NAS.\nTarda 1-2 minutos en arrancar."
                 else "No se pudo usar el NAS: ${r.texto}" + pista(r.texto)
             )
         }
@@ -298,12 +407,19 @@ class MainActivity : Activity() {
 
     // ---------------- Apagar / reiniciar ----------------
 
-    private fun ordenServidor(cmd: String, txt: String) {
-        avisar(txt)
+    private fun apagar(e: Equipo, reiniciar: Boolean) {
+        avisar("${e.nombre}: " + if (reiniciar) "reiniciando…" else "apagando…")
         thread {
-            val h = vivo ?: cfg("servidorLan")
-            val r = ejecutar(cfg("usuario"), h, cmd, "pwServidor")
-            avisar(if (r.ok || cortado(r.texto)) "Orden enviada." else "Error: ${r.texto}" + pista(r.texto))
+            val h = hostDe(e)
+            val r = if (e.so == "linux") {
+                ejecutarLinux(e.usuario, h, if (reiniciar) "SUDO /usr/sbin/reboot" else "SUDO /usr/sbin/poweroff", "pw_${e.id}")
+            } else {
+                val cmd = if (reiniciar) "shutdown /r /t 0" else "shutdown /s /t 0"
+                val pw = leerClave("pw_${e.id}")
+                val r1 = ssh(e.usuario, h, cmd)
+                if (!r1.ok && !cortado(r1.texto) && !pw.isNullOrEmpty()) ssh(e.usuario, h, cmd, pw) else r1
+            }
+            avisar(if (r.ok || cortado(r.texto)) "${e.nombre}: orden enviada." else "${e.nombre}: error: ${r.texto}" + pista(r.texto))
         }
     }
 
@@ -312,8 +428,15 @@ class MainActivity : Activity() {
 
     private fun esAuth(t: String) = t.contains("Auth fail", true) || t.contains("Auth cancel", true)
 
-    // Ejecuta una orden: primero con la llave del móvil; si hace falta, con la contraseña guardada.
-    private fun ejecutar(usuario: String, host: String, plantilla: String, pwClave: String): Resultado {
+    private fun pista(t: String): String = when {
+        esAuth(t) -> "\n\nRevisa el usuario y la contraseña en Editar."
+        t.contains("password", true) -> "\n\nGuarda la contraseña en Editar para que pueda usar sudo."
+        t.contains("timeout", true) || t.contains("connect", true) -> "\n\n¿Está encendido y conectado? Si estás fuera, activa Tailscale."
+        else -> ""
+    }
+
+    /** Orden en Linux: primero con la llave del móvil; si hace falta, con la contraseña guardada. */
+    private fun ejecutarLinux(usuario: String, host: String, plantilla: String, pwClave: String): Resultado {
         val r = ssh(usuario, host, plantilla.replace("SUDO", "sudo -n"))
         if (r.ok || cortado(r.texto)) return r
         val pw = leerClave(pwClave)
@@ -324,6 +447,93 @@ class MainActivity : Activity() {
             if (r2.ok || cortado(r2.texto) || !esAuth(r2.texto)) return r2
         }
         return ssh(usuario, host, conSudo, pw, pw + "\n")
+    }
+
+    // ---------------- SSH ----------------
+
+    private fun archivoClave() = File(filesDir, "clave_ssh")
+
+    private fun clavePublica(): String {
+        val priv = archivoClave()
+        val pub = File(filesDir, "clave_ssh.pub")
+        if (!priv.exists() || !pub.exists()) {
+            val kp = KeyPair.genKeyPair(JSch(), KeyPair.RSA, 3072)
+            priv.outputStream().use { kp.writePrivateKey(it) }
+            pub.outputStream().use { kp.writePublicKey(it, "mando-servidor-movil") }
+            kp.dispose()
+        }
+        return pub.readText().trim()
+    }
+
+    private fun sesion(usuario: String, host: String, clave: String?): Session {
+        val j = JSch()
+        if (clave == null) {
+            clavePublica()
+            j.addIdentity(archivoClave().absolutePath)
+        }
+        val s = j.getSession(usuario, host, 22)
+        s.setConfig("StrictHostKeyChecking", "no")
+        if (clave != null) {
+            s.setPassword(clave)
+            s.setConfig("PreferredAuthentications", "password,keyboard-interactive")
+        } else {
+            s.setConfig("PreferredAuthentications", "publickey")
+        }
+        s.connect(8000)
+        return s
+    }
+
+    private fun ssh(usuario: String, host: String, orden: String, clave: String? = null, entrada: String? = null): Resultado {
+        if (usuario.isBlank()) return Resultado(false, "falta el usuario")
+        return try {
+            val s = sesion(usuario, host, clave)
+            try {
+                val c = s.openChannel("exec") as ChannelExec
+                c.setCommand(orden)
+                val salida = ByteArrayOutputStream()
+                c.setOutputStream(salida)
+                c.setErrStream(salida)
+                val stdin = c.outputStream
+                c.connect(8000)
+                if (entrada != null) {
+                    stdin.write(entrada.toByteArray())
+                    stdin.flush()
+                }
+                stdin.close()
+                var t = 0
+                while (!c.isClosed && t < 150) {
+                    Thread.sleep(100)
+                    t++
+                }
+                val code = c.exitStatus
+                c.disconnect()
+                Resultado(code == 0, salida.toString().trim().ifEmpty { "código $code" })
+            } finally {
+                s.disconnect()
+            }
+        } catch (e: Exception) {
+            Resultado(false, e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun instalarLlave(pub: String, previo: String) =
+        "${previo}mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && " +
+            "(grep -qF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys"
+
+    /** Instala la llave del móvil y el permiso de sudo en un equipo Linux o en el NAS, usando la contraseña. */
+    private fun autorizar(nombre: String, usuario: String, host: String, pw: String, previo: String, sudoers: String) {
+        thread {
+            val pub = try {
+                clavePublica()
+            } catch (e: Exception) {
+                avisar("$nombre: no se pudo crear la llave: ${e.message}")
+                return@thread
+            }
+            avisar("$nombre: autorizando este móvil…")
+            val r1 = ssh(usuario, host, instalarLlave(pub, previo), pw)
+            val r2 = if (r1.ok) ssh(usuario, host, "sudo -S -p '' sh -c \"$sudoers\"", pw, pw + "\n") else r1
+            avisar("$nombre: " + if (r1.ok && r2.ok) "móvil autorizado ✔" else "no se pudo autorizar (${r2.texto})" + pista(r2.texto))
+        }
     }
 
     // ---------------- Contraseñas cifradas (Android Keystore) ----------------
@@ -364,194 +574,162 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun pista(t: String): String =
-        if (t.contains("Auth fail", true) || t.contains("password", true) || t.contains("contraseña", true))
-            "\n\nPulsa «Autorizar este móvil»."
-        else ""
+    // ---------------- Diálogos ----------------
 
-    // ---------------- SSH ----------------
-
-    private fun archivoClave() = File(filesDir, "clave_ssh")
-
-    private fun clavePublica(): String {
-        val priv = archivoClave()
-        val pub = File(filesDir, "clave_ssh.pub")
-        if (!priv.exists() || !pub.exists()) {
-            val kp = KeyPair.genKeyPair(JSch(), KeyPair.RSA, 3072)
-            priv.outputStream().use { kp.writePrivateKey(it) }
-            pub.outputStream().use { kp.writePublicKey(it, "mando-servidor-movil") }
-            kp.dispose()
-        }
-        return pub.readText().trim()
-    }
-
-    private fun sesion(usuario: String, host: String, clave: String?): Session {
-        val j = JSch()
-        if (clave == null) {
-            clavePublica()
-            j.addIdentity(archivoClave().absolutePath)
-        }
-        val s = j.getSession(usuario, host, 22)
-        s.setConfig("StrictHostKeyChecking", "no")
-        if (clave != null) {
-            s.setPassword(clave)
-            s.setConfig("PreferredAuthentications", "password,keyboard-interactive")
-        } else {
-            s.setConfig("PreferredAuthentications", "publickey")
-        }
-        s.connect(8000)
-        return s
-    }
-
-    private fun ssh(usuario: String, host: String, orden: String, clave: String? = null, entrada: String? = null): Resultado {
-        return try {
-            val s = sesion(usuario, host, clave)
-            try {
-                val c = s.openChannel("exec") as ChannelExec
-                c.setCommand(orden)
-                val salida = ByteArrayOutputStream()
-                c.setOutputStream(salida)
-                c.setErrStream(salida)
-                val stdin = c.outputStream
-                c.connect(8000)
-                if (entrada != null) {
-                    stdin.write(entrada.toByteArray())
-                    stdin.flush()
-                }
-                stdin.close()
-                var t = 0
-                while (!c.isClosed && t < 150) {
-                    Thread.sleep(100)
-                    t++
-                }
-                val code = c.exitStatus
-                c.disconnect()
-                Resultado(code == 0, salida.toString().trim().ifEmpty { "código $code" })
-            } finally {
-                s.disconnect()
-            }
-        } catch (e: Exception) {
-            Resultado(false, e.message ?: e.javaClass.simpleName)
-        }
-    }
-
-    // ---------------- Autorizar ----------------
-
-    private fun campoClave(pista: String) = EditText(this).apply {
-        hint = pista
-        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-    }
-
-    private fun autorizar() {
-        val caja = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-        }
+    private fun etiqueta(caja: LinearLayout, t: String) {
         caja.addView(TextView(this).apply {
-            text = "El móvil instala su propia llave en el servidor y en el NAS. Las contraseñas se guardan cifradas en el móvil como respaldo.\n\nPara el NAS tienes que estar en casa o con Tailscale activo."
-            textSize = 14f
+            text = t
+            textSize = 13f
+            setPadding(0, dp(10), 0, 0)
         })
-        val ps = campoClave("Contraseña del servidor")
-        val pn = campoClave("Contraseña del NAS (opcional)")
-        caja.addView(ps)
-        caja.addView(pn)
-        AlertDialog.Builder(this)
-            .setTitle("Autorizar este móvil")
-            .setView(caja)
-            .setPositiveButton("Autorizar") { _, _ -> hacerAutorizar(ps.text.toString(), pn.text.toString()) }
+    }
+
+    private fun campo(caja: LinearLayout, t: String, valor: String, pista: String = ""): EditText {
+        etiqueta(caja, t)
+        val e = EditText(this).apply {
+            setText(valor)
+            hint = pista
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine(true)
+        }
+        caja.addView(e)
+        return e
+    }
+
+    private fun campoClave(caja: LinearLayout, t: String, guardada: Boolean): EditText {
+        etiqueta(caja, t + if (guardada) " (guardada)" else "")
+        val e = EditText(this).apply {
+            hint = if (guardada) "En blanco = no cambiarla" else ""
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        caja.addView(e)
+        return e
+    }
+
+    private fun nuevaCaja() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(20), dp(8), dp(20), dp(8))
+    }
+
+    private fun editarEquipo(orig: Equipo?) {
+        val caja = nuevaCaja()
+        val fNombre = campo(caja, "Nombre", orig?.nombre ?: "", "Ej. PC del salón")
+
+        etiqueta(caja, "Tipo de equipo")
+        val grupo = RadioGroup(this)
+        val opciones = listOf("linux" to "Linux / servidor", "windows" to "Windows", "wol" to "Solo encender")
+        val ids = HashMap<Int, String>()
+        for ((clave, texto) in opciones) {
+            val rb = RadioButton(this).apply { text = texto; id = View.generateViewId() }
+            ids[rb.id] = clave
+            grupo.addView(rb)
+            if (clave == (orig?.so ?: "windows")) grupo.check(rb.id)
+        }
+        caja.addView(grupo)
+
+        val fMac = campo(caja, "MAC (de la tarjeta de red por cable)", orig?.mac ?: "", "Ej. 80:ee:73:aa:bb:cc")
+        val fLan = campo(caja, "IP en casa", orig?.lan ?: "192.168.1.", "Ej. 192.168.1.159")
+        val fTs = campo(caja, "IP de Tailscale (opcional)", orig?.ts ?: "", "Ej. 100.79.163.44")
+        val fUsu = campo(caja, "Usuario (para apagar y reiniciar)", orig?.usuario ?: "", "Usuario de Linux o de Windows")
+        val fPw = campoClave(caja, "Contraseña", orig != null && leerClave("pw_${orig.id}") != null)
+        val fWeb = campo(caja, "Dirección web (opcional)", orig?.web ?: "", "Ej. http://192.168.1.180/")
+        caja.addView(TextView(this).apply {
+            textSize = 12f
+            setTextColor(GRIS)
+            setPadding(0, dp(12), 0, 0)
+            text = "Windows: para apagar y reiniciar, activa «Servidor OpenSSH» en Configuración → Sistema → Características opcionales, y usa tu usuario y contraseña de Windows.\n\n" +
+                "Linux: al guardar con contraseña, el móvil se autoriza solo (llave + permiso para apagar).\n\n" +
+                "Para encender: el equipo debe ir por cable y tener activado Wake-on-LAN en la BIOS y en la tarjeta de red."
+        })
+
+        val b = AlertDialog.Builder(this)
+            .setTitle(if (orig == null) "Añadir equipo" else "Editar ${orig.nombre}")
+            .setView(ScrollView(this).apply { addView(caja) })
+            .setPositiveButton("Guardar", null)
             .setNegativeButton("Cancelar", null)
-            .show()
+        if (orig != null) b.setNeutralButton("Borrar", null)
+        val d = b.create()
+        d.setOnShowListener {
+            d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val nombre = fNombre.text.toString().trim()
+                val mac = fMac.text.toString().trim()
+                val so = ids[grupo.checkedRadioButtonId] ?: "wol"
+                when {
+                    nombre.isEmpty() -> mensaje("Falta el nombre", "Ponle un nombre al equipo.")
+                    mac.isNotEmpty() && macBytes(mac) == null -> mensaje("MAC incorrecta", "Ejemplo de MAC: 80:ee:73:aa:bb:cc")
+                    else -> {
+                        val e = Equipo(
+                            id = orig?.id ?: ("e" + System.currentTimeMillis()),
+                            nombre = nombre, so = so, mac = mac,
+                            lan = fLan.text.toString().trim().removeSuffix("."),
+                            ts = fTs.text.toString().trim(),
+                            usuario = fUsu.text.toString().trim(),
+                            web = fWeb.text.toString().trim(),
+                        )
+                        equipos = if (orig == null) equipos + e else equipos.map { if (it.id == e.id) e else it }
+                        guardar()
+                        val pw = fPw.text.toString()
+                        if (pw.isNotEmpty()) {
+                            guardarClave("pw_${e.id}", pw)
+                            if (so == "linux" && e.usuario.isNotEmpty()) {
+                                autorizar(
+                                    e.nombre, e.usuario, hostDe(e), pw, "",
+                                    "echo '${e.usuario} ALL=(root) NOPASSWD: /usr/sbin/poweroff, /usr/sbin/reboot' > /etc/sudoers.d/mando && chmod 440 /etc/sudoers.d/mando"
+                                )
+                            }
+                        }
+                        vivos.remove(e.id)
+                        pintar()
+                        d.dismiss()
+                    }
+                }
+            }
+            if (orig != null) {
+                d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                    confirmar("¿Borrar ${orig.nombre}?", "Solo se quita de la app.") {
+                        equipos = equipos.filter { it.id != orig.id }
+                        guardar()
+                        prefs.edit().remove("pw_${orig.id}").apply()
+                        vivos.remove(orig.id)
+                        pintar()
+                        d.dismiss()
+                    }
+                }
+            }
+        }
+        d.show()
     }
 
-    private fun instalarLlave(pub: String, previo: String) =
-        "${previo}mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && " +
-            "(grep -qF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys"
-
-    private fun hacerAutorizar(ps: String, pn: String) {
-        if (ps.isNotEmpty()) guardarClave("pwServidor", ps)
-        if (pn.isNotEmpty()) guardarClave("pwNas", pn)
-        avisar("Autorizando… (la primera vez tarda unos segundos en crear la llave)")
-        thread {
-            val pub = try {
-                clavePublica()
-            } catch (e: Exception) {
-                avisar("No se pudo crear la llave: ${e.message}")
-                return@thread
-            }
-            val partes = mutableListOf<String>()
-            if (ps.isNotEmpty()) {
-                val u = cfg("usuario")
-                val h = vivo ?: cfg("servidorLan")
-                val r1 = ssh(u, h, instalarLlave(pub, ""), ps)
-                val r2 = if (r1.ok) ssh(
-                    u, h,
-                    "sudo -S -p '' sh -c \"echo '$u ALL=(root) NOPASSWD: /usr/sbin/poweroff, /usr/sbin/reboot' > /etc/sudoers.d/mando && chmod 440 /etc/sudoers.d/mando\"",
-                    ps, ps + "\n"
-                ) else r1
-                partes += "Servidor: " + if (r1.ok && r2.ok) "autorizado ✔" else "error (${r2.texto})"
-            }
-            if (pn.isNotEmpty()) {
-                val u = cfg("nasUsuario")
-                val h = if (listOf(445, 5000, 5001).any { puerto(cfg("nasLan"), it, 600) }) cfg("nasLan") else cfg("nasTs")
-                val r1 = ssh(u, h, instalarLlave(pub, "chmod 755 ~ && "), pn)
-                val r2 = if (r1.ok) ssh(
-                    u, h,
-                    "sudo -S -p '' sh -c \"echo '$u ALL=(root) NOPASSWD: /usr/syno/sbin/synonet, /usr/syno/bin/synonet' > /etc/sudoers.d/despertar && chmod 440 /etc/sudoers.d/despertar\"",
-                    pn, pn + "\n"
-                ) else r1
-                partes += "NAS: " + if (r1.ok && r2.ok) "autorizado ✔" else "error (${r2.texto})"
-            }
-            avisar(if (partes.isEmpty()) "No has escrito ninguna contraseña." else partes.joinToString("\n"))
-        }
-    }
-
-    // ---------------- Ajustes ----------------
-
-    private fun ajustes() {
-        val caja = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-        }
-        val cajas = mutableMapOf<String, EditText>()
-        for ((k, v) in campos) {
-            caja.addView(TextView(this).apply {
-                text = v.first
-                textSize = 13f
-                setPadding(0, dp(10), 0, 0)
-            })
-            val e = EditText(this).apply {
-                setText(cfg(k))
-                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                setSingleLine(true)
-            }
-            caja.addView(e)
-            cajas[k] = e
-        }
+    private fun ajustesNas() {
+        val caja = nuevaCaja()
         caja.addView(TextView(this).apply {
-            text = "Contraseña del servidor" + (if (leerClave("pwServidor") != null) " (guardada)" else "")
             textSize = 13f
-            setPadding(0, dp(10), 0, 0)
+            text = "Fuera de casa, el NAS (siempre encendido) envía la señal de encendido a tus equipos. Necesitas Tailscale activo en el móvil y SSH activado en el NAS (Panel de control → Terminal y SNMP)."
         })
-        val pwS = campoClave("En blanco = no cambiarla")
-        caja.addView(pwS)
-        caja.addView(TextView(this).apply {
-            text = "Contraseña del NAS" + (if (leerClave("pwNas") != null) " (guardada)" else "")
-            textSize = 13f
-            setPadding(0, dp(10), 0, 0)
-        })
-        val pwN = campoClave("En blanco = no cambiarla")
-        caja.addView(pwN)
+        val cajas = LinkedHashMap<String, EditText>()
+        for ((k, v) in nasCampos) cajas[k] = campo(caja, v.first, nas(k))
+        val fPw = campoClave(caja, "Contraseña del NAS", leerClave("pwNas") != null)
         AlertDialog.Builder(this)
-            .setTitle("Ajustes")
+            .setTitle("Ajustes del NAS")
             .setView(ScrollView(this).apply { addView(caja) })
             .setPositiveButton("Guardar") { _, _ ->
                 val ed = prefs.edit()
                 for ((k, e) in cajas) ed.putString(k, e.text.toString().trim())
                 ed.apply()
-                if (pwS.text.isNotEmpty()) guardarClave("pwServidor", pwS.text.toString())
-                if (pwN.text.isNotEmpty()) guardarClave("pwNas", pwN.text.toString())
-                if (macBytes() == null) avisar("La MAC no parece correcta (ejemplo: 80:ee:73:aa:bb:cc).")
-                else avisar("Ajustes guardados.")
+                val pw = fPw.text.toString()
+                if (pw.isNotEmpty()) {
+                    guardarClave("pwNas", pw)
+                    thread {
+                        val h = if (listOf(445, 5000, 5001).any { puerto(nas("nasLan"), it, 600) }) nas("nasLan") else nas("nasTs")
+                        val u = nas("nasUsuario")
+                        autorizar(
+                            "NAS", u, h, pw, "chmod 755 ~ && ",
+                            "echo '$u ALL=(root) NOPASSWD: /usr/syno/sbin/synonet, /usr/syno/bin/synonet' > /etc/sudoers.d/despertar && chmod 440 /etc/sudoers.d/despertar"
+                        )
+                    }
+                } else {
+                    avisar("Ajustes del NAS guardados.")
+                }
             }
             .setNegativeButton("Cancelar", null)
             .show()

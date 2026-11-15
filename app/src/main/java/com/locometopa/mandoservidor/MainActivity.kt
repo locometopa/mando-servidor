@@ -34,6 +34,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -84,6 +86,9 @@ class MainActivity : Activity() {
     @Volatile private var equipos: List<Equipo> = emptyList()
     private val vivos = ConcurrentHashMap<String, String>()   // id -> host que responde ("" = apagado)
     private val estados = HashMap<String, TextView>()
+    private val statsTv = HashMap<String, TextView>()
+    private val stats = ConcurrentHashMap<String, String>()
+    private val ultimoStats = ConcurrentHashMap<String, Long>()
     @Volatile private var generacion = 0
 
     private val nasCampos = linkedMapOf(
@@ -172,17 +177,20 @@ class MainActivity : Activity() {
         raiz.addView(lista)
         raiz.addView(boton("+  Añadir equipo", GRIS_OSC) { editarEquipo(null) })
         raiz.addView(boton("Ajustes del NAS (encender desde fuera)", GRIS_OSC) { ajustesNas() })
+        raiz.addView(boton("Buscar actualización (versión 1.${versionActual()})", GRIS_OSC, 46) { buscarActualizacion(true) })
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(FONDO)
             addView(raiz)
         })
         pintar()
+        buscarActualizacion(false)
     }
 
     private fun pintar() {
         lista.removeAllViews()
         estados.clear()
+        statsTv.clear()
         for (e in equipos) lista.addView(tarjeta(e))
         for (e in equipos) mostrarEstado(e)
     }
@@ -221,6 +229,16 @@ class MainActivity : Activity() {
         }
         estados[e.id] = est
         card.addView(est)
+        if (e.so == "linux") {
+            val st = TextView(this).apply {
+                textSize = 13f
+                setTextColor(GRIS)
+                setPadding(0, dp(4), 0, 0)
+                text = stats[e.id] ?: ""
+            }
+            statsTv[e.id] = st
+            card.addView(st)
+        }
 
         val fila = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         fun peq(t: String, c: Int, a: () -> Unit) {
@@ -239,6 +257,9 @@ class MainActivity : Activity() {
             }
         }
         card.addView(fila)
+        if (e.so == "linux") {
+            card.addView(boton("Contenedores Docker", AZUL, 44) { contenedores(e) })
+        }
         if (e.web.isNotBlank()) {
             card.addView(boton("Abrir web", AZUL, 44) {
                 val h = vivos[e.id]
@@ -306,8 +327,21 @@ class MainActivity : Activity() {
             while (gen == generacion) {
                 val hilos = equipos.map { e ->
                     thread {
-                        vivos[e.id] = comprobar(e) ?: ""
+                        val h = comprobar(e)
+                        vivos[e.id] = h ?: ""
                         ui.post { mostrarEstado(e) }
+                        if (h == null) {
+                            stats.remove(e.id)
+                            ultimoStats.remove(e.id)
+                            ui.post { statsTv[e.id]?.text = "" }
+                        } else if (e.so == "linux" && System.currentTimeMillis() - (ultimoStats[e.id] ?: 0L) > 30000) {
+                            ultimoStats[e.id] = System.currentTimeMillis()
+                            val t = leerStats(e, h)
+                            if (t != null) {
+                                stats[e.id] = t
+                                ui.post { statsTv[e.id]?.text = t }
+                            }
+                        }
                     }
                 }
                 hilos.forEach { it.join() }
@@ -344,6 +378,147 @@ class MainActivity : Activity() {
     }
 
     private fun hostDe(e: Equipo): String = vivos[e.id]?.takeIf { it.isNotEmpty() } ?: e.lan
+
+    // ---------------- Estado del servidor (CPU, RAM, temperatura, discos) ----------------
+
+    private val ordenStats = (
+        "echo \"C §(cut -d' ' -f1 /proc/loadavg) §(nproc)\"; " +
+            "free -m | awk '/^Mem/{print \"M\",§3,§2}'; " +
+            "echo \"T §(cat /sys/class/hwmon/hwmon*/temp*_input 2>/dev/null | sort -n | tail -1)\"; " +
+            "df -h / /datos 2>/dev/null | awk 'NR>1{print \"D\",§6,§5}'; " +
+            "echo \"U §(cut -d. -f1 /proc/uptime)\""
+        ).replace("§", "$")
+
+    private fun leerStats(e: Equipo, host: String): String? {
+        val r = ssh(e.usuario, host, ordenStats)
+        if (!r.ok) return null
+        val partes = mutableListOf<String>()
+        val linea2 = mutableListOf<String>()
+        for (l in r.texto.lines()) {
+            val p = l.trim().split(Regex("\\s+"))
+            when (p.getOrNull(0)) {
+                "C" -> if (p.size >= 3) partes += "Carga ${p[1]} (${p[2]} hilos)"
+                "M" -> {
+                    val u = p.getOrNull(1)?.toDoubleOrNull()
+                    val t = p.getOrNull(2)?.toDoubleOrNull()
+                    if (u != null && t != null && t > 0) partes += String.format("RAM %.1f/%.1f GB", u / 1024, t / 1024)
+                }
+                "T" -> p.getOrNull(1)?.toIntOrNull()?.let { if (it > 0) partes += "${it / 1000} °C" }
+                "D" -> if (p.size >= 3) linea2 += "Disco ${p[1]} ${p[2]}"
+                "U" -> p.getOrNull(1)?.toLongOrNull()?.let { seg ->
+                    val d = seg / 86400
+                    val h = (seg % 86400) / 3600
+                    val m = (seg % 3600) / 60
+                    linea2 += "lleva " + when {
+                        d > 0 -> "$d d $h h"
+                        h > 0 -> "$h h $m min"
+                        else -> "$m min"
+                    }
+                }
+            }
+        }
+        val l2 = linea2.joinToString(" · ")
+        return partes.joinToString(" · ") + if (l2.isNotEmpty()) "\n$l2" else ""
+    }
+
+    // ---------------- Contenedores Docker ----------------
+
+    private fun contenedores(e: Equipo) {
+        avisar("${e.nombre}: leyendo contenedores…")
+        thread {
+            val r = ssh(e.usuario, hostDe(e), "docker ps -a --format '{{.Names}}|{{.Status}}'")
+            if (!r.ok) {
+                avisar("${e.nombre}: no se pudieron leer los contenedores: ${r.texto}" + pista(r.texto))
+                return@thread
+            }
+            val lista = r.texto.lines().mapNotNull { l ->
+                val p = l.split("|", limit = 2)
+                val n = p[0].trim()
+                if (p.size == 2 && Regex("^[A-Za-z0-9_.-]+$").matches(n)) n to p[1].trim() else null
+            }.sortedBy { it.first }
+            ui.post {
+                aviso.text = ""
+                if (isFinishing) return@post
+                val textos = lista.map { (n, st) ->
+                    (if (st.startsWith("Up")) "🟢  " else "🔴  ") + n + "  ·  " + estadoDocker(st)
+                }.toTypedArray()
+                AlertDialog.Builder(this)
+                    .setTitle("Contenedores de ${e.nombre}")
+                    .setItems(textos) { _, i -> accionContenedor(e, lista[i].first, lista[i].second.startsWith("Up")) }
+                    .setNegativeButton("Cerrar", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun estadoDocker(st: String) = when {
+        st.startsWith("Up") -> "en marcha" + if (st.contains("unhealthy")) " (con problemas)" else ""
+        st.startsWith("Exited") -> "parado"
+        st.startsWith("Restarting") -> "reiniciándose"
+        st.startsWith("Created") -> "creado"
+        else -> st
+    }
+
+    private fun accionContenedor(e: Equipo, nombre: String, enMarcha: Boolean) {
+        val acciones = if (enMarcha) arrayOf("Reiniciar", "Parar") else arrayOf("Arrancar")
+        AlertDialog.Builder(this)
+            .setTitle(nombre)
+            .setItems(acciones) { _, i ->
+                val (cmd, txt) = when (acciones[i]) {
+                    "Reiniciar" -> "restart" to "reiniciando"
+                    "Parar" -> "stop" to "parando"
+                    else -> "start" to "arrancando"
+                }
+                avisar("$nombre: $txt…")
+                thread {
+                    val r = ssh(e.usuario, hostDe(e), "docker $cmd $nombre")
+                    avisar(if (r.ok) "$nombre: hecho ✔" else "$nombre: error: ${r.texto}")
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // ---------------- Actualizaciones ----------------
+
+    private fun versionActual(): Int = try {
+        (packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0").substringAfter(".").toIntOrNull() ?: 0
+    } catch (e: Exception) {
+        0
+    }
+
+    private fun buscarActualizacion(manual: Boolean) {
+        if (manual) avisar("Buscando actualización…")
+        thread {
+            try {
+                val c = URL("https://api.github.com/repos/locometopa/mando-servidor/releases/latest").openConnection() as HttpURLConnection
+                c.setRequestProperty("User-Agent", "MandoServidor")
+                c.setRequestProperty("Accept", "application/vnd.github+json")
+                c.connectTimeout = 8000
+                c.readTimeout = 8000
+                val j = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                val nueva = j.optString("tag_name").substringAfter(".").toIntOrNull() ?: 0
+                val url = j.optJSONArray("assets")?.optJSONObject(0)?.optString("browser_download_url") ?: ""
+                val actual = versionActual()
+                if (nueva > actual && url.isNotEmpty()) {
+                    ui.post {
+                        if (isFinishing) return@post
+                        aviso.text = ""
+                        AlertDialog.Builder(this)
+                            .setTitle("Nueva versión 1.$nueva")
+                            .setMessage("Tienes la 1.$actual. ¿La descargas ahora? Se instala encima sin perder tus equipos ni contraseñas.")
+                            .setPositiveButton("Descargar") { _, _ -> abrir(url) }
+                            .setNegativeButton("Más tarde", null)
+                            .show()
+                    }
+                } else if (manual) {
+                    avisar("Ya tienes la última versión (1.$actual).")
+                }
+            } catch (e: Exception) {
+                if (manual) avisar("No se pudo comprobar: ${e.message}")
+            }
+        }
+    }
 
     // ---------------- Encender ----------------
 

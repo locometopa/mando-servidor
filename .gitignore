@@ -24,3 +24,4 @@ __pycache__/
 *.key
 .env
 .env.*
+*.apk

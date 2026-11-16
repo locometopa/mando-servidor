@@ -28,10 +28,10 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: gradle assembleRelease --no-daemon --stacktrace
       - name: Renombrar
-        run: cp app/build/outputs/apk/release/app-release.apk "MandoServidor-1.${{ github.run_number }}.apk"
+        run: cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/MandoServidor-1.${{ github.run_number }}.apk"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.${{ github.run_number }}
           name: Mando servidor 1.${{ github.run_number }}
-          files: MandoServidor-*.apk
+          files: ${{ runner.temp }}/MandoServidor-1.${{ github.run_number }}.apk
           make_latest: true

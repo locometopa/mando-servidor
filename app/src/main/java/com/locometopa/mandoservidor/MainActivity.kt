@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import androidx.core.content.FileProvider
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -498,16 +499,39 @@ class MainActivity : Activity() {
                 c.readTimeout = 8000
                 val j = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
                 val nueva = j.optString("tag_name").substringAfter(".").toIntOrNull() ?: 0
-                val url = j.optJSONArray("assets")?.optJSONObject(0)?.optString("browser_download_url") ?: ""
                 val actual = versionActual()
+                // Buscar el asset que coincida con la versión nueva
+                var url = ""
+                val assets = j.optJSONArray("assets")
+                if (assets != null) {
+                    val buscado = "MandoServidor-1.$nueva.apk"
+                    for (i in 0 until assets.length()) {
+                        val a = assets.optJSONObject(i) ?: continue
+                        if (a.optString("name") == buscado) {
+                            url = a.optString("browser_download_url")
+                            break
+                        }
+                    }
+                    // Si no encuentra el exacto, coger el último .apk
+                    if (url.isEmpty()) {
+                        for (i in assets.length() - 1 downTo 0) {
+                            val a = assets.optJSONObject(i) ?: continue
+                            if (a.optString("name").endsWith(".apk")) {
+                                url = a.optString("browser_download_url")
+                                break
+                            }
+                        }
+                    }
+                }
                 if (nueva > actual && url.isNotEmpty()) {
+                    val urlFinal = url
                     ui.post {
                         if (isFinishing) return@post
                         aviso.text = ""
                         AlertDialog.Builder(this)
                             .setTitle("Nueva versión 1.$nueva")
                             .setMessage("Tienes la 1.$actual. ¿La descargas ahora? Se instala encima sin perder tus equipos ni contraseñas.")
-                            .setPositiveButton("Descargar") { _, _ -> abrir(url) }
+                            .setPositiveButton("Descargar") { _, _ -> descargarEInstalar(urlFinal, nueva) }
                             .setNegativeButton("Más tarde", null)
                             .show()
                     }
@@ -516,6 +540,38 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 if (manual) avisar("No se pudo comprobar: ${e.message}")
+            }
+        }
+    }
+
+    private fun descargarEInstalar(url: String, version: Int) {
+        avisar("Descargando versión 1.$version…")
+        thread {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.setRequestProperty("User-Agent", "MandoServidor")
+                c.instanceFollowRedirects = true
+                c.connectTimeout = 15000
+                c.readTimeout = 30000
+                val apk = File(cacheDir, "MandoServidor-1.$version.apk")
+                c.inputStream.use { input -> apk.outputStream().use { output -> input.copyTo(output) } }
+                c.disconnect()
+                ui.post {
+                    if (isFinishing) return@post
+                    try {
+                        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "application/vnd.android.package-archive")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                    } catch (e: Exception) {
+                        avisar("Error al instalar: ${e.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                ui.post { avisar("Error al descargar: ${e.message}") }
             }
         }
     }

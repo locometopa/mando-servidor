@@ -50,4 +50,5 @@ android {
 dependencies {
     implementation("com.github.mwiede:jsch:0.2.21")
     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("androidx.core:core-ktx:1.13.1")
 }
